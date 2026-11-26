@@ -175,27 +175,91 @@ flowchart TD
     Q["Query: /api/v1/query, query_range, series,<br/>labels, label/*/values, metadata"] --> R["Any Hearth: router"]
     R --> F{"Candidates: state == in_sync<br/>and has_data_since <= query start"}
     F -- none --> E503["503 (or opt-in: least-lagging node,<br/>with warning header)"]
-    F -- some --> PICK["Pick one: sticky hash by client,<br/>prefer local node"]
+    F -- some --> PICK["Pick one: prefer local node<br/>(sticky hash by client: M5)"]
     PICK --> SEND["Proxy request unmodified"]
     SEND --> OK{"Success?"}
     OK -- yes --> RESP["Return response"]
     OK -- "error / timeout / 5xx" --> NEXT["Retry next candidate"] --> SEND
 ```
 
-Node states (shared via Raft so all routers agree):
+Reads always go through the owning node's Hearth, because each Prometheus listens on
+localhost only (§1). A router never talks to another node's Prometheus directly.
+
+```
+Grafana → Hearth 1 → Hearth 3 → P3     (remote node)
+Grafana → Hearth 1 → P1                (local node, no extra hop)
+```
+
+A node is a read candidate only if all of these hold. Each one is answered by a
+different party:
+
+| Question | Who answers | Shared? |
+|---|---|---|
+| Is P3 ready? | Hearth 3 only: polls local `/-/ready`, reports it via its own `/ready` | Same answer for everyone |
+| Can I reach Hearth 3? | Each router, by polling Hearth 3's `/ready` | No: per router, views may differ |
+| Does P3 have all the data? | Write leader, from `applied_offset` vs `commit_offset` (M5+) | Yes, via Raft |
+
+Health check defaults (all tunable): interval 10s, timeout 1s, down after 3
+consecutive failures, up after 1 success.
+
+Retry timing (one clock per query). Values are defaults; all three settings are tunable.
+
+| Setting | Default | Why this default | Tune when |
+|---|---|---|---|
+| Total deadline | 29s | Grafana `dataproxy.timeout` default 30s minus a 1s margin for sending the result back. | The client's timeout differs. Must stay below it. |
+| Connect timeout | 2s | Survives one lost SYN (first resend at 1s, RFC 6298). Same as etcd's peer dial timeout. | Nodes are farther apart (cross-zone/region). |
+| Max attempts | 3 | Each node at most once, so never more than the number of ready nodes. Worst case 3 × 2s of failed connects. Not tied to node count. | Cluster size or load differs. |
+| Response timeout | (not a setting) | Each attempt gets whatever is left of the deadline. Slow failures are not retried, so nothing needs saving for a later attempt. | n/a |
+
+Startup checks: `connect timeout < deadline` and `max attempts × connect timeout`
+≤ half the deadline. Hearth **refuses to start** if any check fails.
+
+Response buffering: the routing Hearth buffers the full response before sending
+anything, so a failure mid-response can still be retried. Limit **8 MiB** (rough
+default, to be tuned from measured response sizes). Above it, switch to streaming and
+stop retrying that query.
+
+Request limits and Hearth-generated errors:
+
+- **Max query body: 10 MiB, a constant (not configurable).** It matches the limit
+  Prometheus actually applies, which today is Go's `net/http` form default
+  (`parsePostForm`). Hearth reads the body as raw bytes, so Go's default does not apply
+  to Hearth itself. Over the limit → `413`. `test/contract` checks the Prometheus side
+  and fails if a Prometheus/Go upgrade changes it.
+- **`X-Hearth-Error: <reason>`** marks any error response produced by Hearth itself rather
+  than relayed from Prometheus (e.g. local Prometheus not ready, body too large). No
+  header = Prometheus's own answer. The routing Hearth uses it to decide whether a retry
+  can help, and it is passed through to the client to help with debugging.
+
+  | Where | What happened | `X-Hearth-Error` | Status | Routing Hearth retries? |
+  |---|---|---|---|---|
+  | Serving Hearth | Local Prometheus not ready | `not_ready` | 503 | Yes |
+  | Serving Hearth | Local Prometheus unreachable | `backend_unreachable` | 502 | Yes |
+  | Routing Hearth | Body over 10 MiB | `body_too_large` | 413 | No |
+  | Routing Hearth | No ready node | `no_candidates` | 503 | No (gives up) |
+  | Routing Hearth | All attempts failed (max 3) | `retries_exhausted` | 502 | No (gives up) |
+  | Routing Hearth | Total deadline ran out | `deadline_exceeded` | 504 | No (gives up) |
+  | Routing Hearth | Client disconnected | — (no response) | logged as 499 | No |
+
+  Retry decisions use the reason code; the status is for humans debugging.
+  Error body: Prometheus's JSON error format,
+  `{"status":"error","errorType":"<type>","error":"<message>"}`, so Grafana shows the
+  message to the user. `errorType` uses Prometheus's own values (e.g. `unavailable`,
+  `timeout`, `bad_data`, `internal`; see `web/api/v1/api.go`).
+
+Node data state (decided by the write leader, shared via Raft so all routers agree; M5+):
 
 ```mermaid
 stateDiagram-v2
     [*] --> catching_up: joins / restarts
     catching_up --> in_sync: applied_offset ≈ commit_offset
-    in_sync --> catching_up: lag > read.max_lag
-    in_sync --> down: health check fails
-    catching_up --> down: health check fails
-    down --> catching_up: health check passes
+    in_sync --> catching_up: lag > read.max_lag or stops pulling
 ```
 
 - `in_sync` is decided by **replication lag**, not just `/-/ready`. A reachable node
   with a gap must not serve reads.
+- Reachability is **not** part of this shared state. It stays local to each router
+  (see the table above; §5 keeps raw health-check results out of Raft).
 - Optional: hedged requests to a second in-sync node after `read.hedge_after`.
 
 ---
@@ -268,14 +332,17 @@ internal/raftfsm/      Raft FSM, snapshot, state schema
 internal/forward/      follower → leader forwarding, hold-and-retry
 internal/router/       read routing, health, node state, retries/hedging
 internal/server/       HTTP wiring, /leader, /ready, /metrics
-test/compose/          docker-compose test bed (3 nodes, 2 scrapers, Grafana)
-test/chaos/            kill / pause / netem scripts
+test/cluster/          local test bed: plain Prometheus binaries + Hearth nodes
+test/chaos/            kill / pause / netem scripts (run on a Linux VM fleet)
 test/checker/          cross-node consistency checker
 docs/design.md         this file
 docs/log.md            decision log ("failure that forced it")
+flake.nix              dev shell, build, test and cluster commands
 ```
 
 Language: **Go** (static binary, cheap goroutines per follower).
+Tooling: **Nix flakes** (no Makefile, no Docker). Prometheus comes from nixpkgs or a
+plain release binary.
 Allowed deps: protobuf runtime, `klauspost/compress` (snappy), `hashicorp/raft`,
 `raft-boltdb`, `client_golang` (own metrics only). Ask before adding others.
 
@@ -301,21 +368,32 @@ flowchart LR
 
 - **Unit:** pure logic (dedup decisions, commit computation, WAL recovery) with
   table-driven tests and an injectable clock. No real sleeps in unit tests.
+- **Router (M1):** fake backends via `httptest`, one test per row of the error table
+  in §4, plus the success path and a backend dying mid-response. Timeouts use short
+  real values (~100–200ms); `testing/synctest` is an option later if tests get slow or
+  flaky. No real Prometheus needed.
+- **Contract:** `test/contract` runs a real Prometheus (skips if not on PATH) to check
+  assumptions Hearth depends on, e.g. the 10 MiB body limit.
 - **WAL crash tests:** kill mid-write (`kill -9`), restart, assert no acked offset is lost
   and torn tails are truncated.
-- **Compose test bed:** `make up` → 3 nodes, 2 scrapers, Grafana.
-- **Chaos:** random kill, `docker pause` (frozen process), `tc netem` delay/partition.
+- **Local test bed:** Hearth nodes + plain Prometheus processes on separate ports and
+  data dirs, started from the flake. No containers.
+- **Chaos:** random kill, `kill -STOP`/`-CONT` (frozen process), `tc netem`
+  delay/partition. Runs on a Linux VM fleet via
+  [vfkit-nix](https://github.com/melonlorrd/vfkit-nix) (Apple Silicon); also the place
+  to measure fsync/group-commit latency, since macOS `F_FULLFSYNC` is not representative.
 - **Consistency checker:** after each chaos run, query every node for the same series
   and range; results must be identical for all `in_sync` nodes. This is the
   correctness proof.
 
-Commands (to be created):
+Commands (to be created; names may change):
 
 ```
-make build      # go build ./cmd/hearth
-make test       # go test ./... -race
-make up / down  # compose test bed
-make chaos      # run chaos scenario + checker
+nix develop          # dev shell: go, prometheus, protoc
+nix build            # build hearth
+nix run .#test       # go test ./... -race
+nix run .#cluster    # local test bed
+nix run .#chaos      # chaos scenario + checker (Linux VM fleet)
 ```
 
 ---

@@ -21,7 +21,8 @@ counts as implementing, ask me first.
 
 ### What you can do freely
 - Test harnesses, fixtures, mocks and test data.
-- Build files, Makefiles, CI config, Docker Compose test beds, scripts.
+- Build files (Nix flake), CI config, local test-bed scripts, other scripts.
+  No Makefile, no Docker.
 - Benchmark and chaos-testing scaffolding.
 - Docs formatting, and drafting entries for docs/log.md from what I tell you.
 - Reading code, docs and upstream source (kernel, libraries) to answer my questions.
@@ -93,4 +94,5 @@ Allowed deps: protobuf runtime, `klauspost/compress`, `hashicorp/raft`, `raft-bo
 - **Current milestone:** M1 — read router with health checks + retry (no code yet).
 - **Known gaps / open questions:** none recorded yet; add to docs/log.md as they come up.
 - **What "done" looks like for M1:** a query hitting any Hearth is proxied unmodified to a
-  healthy Prometheus, retried on error/timeout/5xx, with a test per failure case.
+  ready node (its local Prometheus directly, or another node's Prometheus via that node's
+  Hearth), retried on error/timeout/5xx, with a test per failure case.
